@@ -6,8 +6,22 @@
 <title>Wheatland Weather Radar</title>
 
 <!--
-  Wheatland Weather Radar — v3
+  Wheatland Weather Radar — v4
   ----------------------------------------------------------
+  v4 fixes "METAR unavailable (Failed to fetch)" by trying a second
+  public CORS proxy (corsproxy.io) automatically if the first
+  (api.allorigins.win) fails. Important nuance behind this: testing a
+  proxy URL by typing it into Safari's address bar does NOT prove it
+  works for our use case — that's a plain page navigation, which is
+  never subject to CORS at all. CORS only restricts JavaScript-
+  initiated fetch() calls, so a proxy can work fine when visited
+  directly while still failing for the page's actual fetch() request.
+  Browsers also deliberately hide the specific reason a CORS fetch
+  failed from JavaScript (a security measure), which is why the error
+  was just a generic "Failed to fetch" with no further detail
+  available — hence trying a second proxy rather than chasing a more
+  specific diagnosis that isn't accessible to us.
+
   v3 fixes the "Zoom Level Not Supported" placeholder tiles you'd see
   covering the radar overlay — that's RainViewer's radar tile API
   refusing zoom levels past 7, the exact same ceiling that caused
@@ -130,7 +144,15 @@
   const START_ZOOM = 7; // matches RainViewer's native radar tile ceiling — see v3 note
 
   const RADAR_REFRESH_MS = 10 * 60 * 1000; // 10 minutes, matches the ESP32 version
-  const METAR_CORS_PROXY = "https://api.allorigins.win/raw?url="; // see KNOWN LIMITATION above
+
+  // Two public CORS proxies, tried in order — see v4 note. Browsers hide
+  // the actual reason a cross-origin fetch() fails (a deliberate security
+  // choice), so rather than chase an undiagnosable "Failed to fetch", we
+  // just try a second proxy automatically if the first one doesn't work.
+  const METAR_CORS_PROXIES = [
+    url => "https://api.allorigins.win/raw?url=" + encodeURIComponent(url),
+    url => "https://corsproxy.io/?url=" + encodeURIComponent(url),
+  ];
 
   const AIRPORTS = [
     { icao: "KBAB", name: "Beale AFB",        lat: 39.13611, lon: -121.43639 },
@@ -196,11 +218,20 @@
 
   async function fetchMetar(icao) {
     const targetUrl = `https://aviationweather.gov/api/data/metar?ids=${icao}&format=raw`;
-    const res = await fetch(METAR_CORS_PROXY + encodeURIComponent(targetUrl));
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const text = (await res.text()).trim();
-    if (!text) throw new Error("empty response");
-    return text;
+    let lastErr = null;
+
+    for (const buildProxyUrl of METAR_CORS_PROXIES) {
+      try {
+        const res = await fetch(buildProxyUrl(targetUrl));
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const text = (await res.text()).trim();
+        if (!text) throw new Error("empty response");
+        return text;
+      } catch (err) {
+        lastErr = err; // try the next proxy in the list
+      }
+    }
+    throw lastErr; // every proxy failed
   }
 
   AIRPORTS.forEach(ap => {
