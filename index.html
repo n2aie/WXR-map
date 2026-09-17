@@ -6,8 +6,16 @@
 <title>Wheatland Weather Radar</title>
 
 <!--
-  Wheatland Weather Radar — v4
+  Wheatland Weather Radar — v5
   ----------------------------------------------------------
+  v5 replaces the public CORS proxies entirely with a personal Cloudflare
+  Worker (metar-proxy.vince320.workers.dev) that fetches METAR data and
+  attaches proper CORS headers itself. This is the permanent fix for the
+  proxy unreliability in v4 — since it's owned rather than a shared free
+  service, it can't suddenly start requiring payment or go down the way
+  corsproxy.io and allorigins.win did. See metar_proxy_worker.js for the
+  Worker's own source and deployment steps.
+
   v4 fixes "METAR unavailable (Failed to fetch)" by trying a second
   public CORS proxy (corsproxy.io) automatically if the first
   (api.allorigins.win) fails. Important nuance behind this: testing a
@@ -145,14 +153,10 @@
 
   const RADAR_REFRESH_MS = 10 * 60 * 1000; // 10 minutes, matches the ESP32 version
 
-  // Two public CORS proxies, tried in order — see v4 note. Browsers hide
-  // the actual reason a cross-origin fetch() fails (a deliberate security
-  // choice), so rather than chase an undiagnosable "Failed to fetch", we
-  // just try a second proxy automatically if the first one doesn't work.
-  const METAR_CORS_PROXIES = [
-    url => "https://api.allorigins.win/raw?url=" + encodeURIComponent(url),
-    url => "https://corsproxy.io/?url=" + encodeURIComponent(url),
-  ];
+  // Your own Cloudflare Worker — see v5 note. Replaces the two public
+  // CORS proxies from v4, which turned out unreliable (corsproxy.io now
+  // requires a paid API key; allorigins.win has been seen timing out).
+  const METAR_WORKER_URL = "https://metar-proxy.vince320.workers.dev/";
 
   const AIRPORTS = [
     { icao: "KBAB", name: "Beale AFB",        lat: 39.13611, lon: -121.43639 },
@@ -217,21 +221,11 @@
   }
 
   async function fetchMetar(icao) {
-    const targetUrl = `https://aviationweather.gov/api/data/metar?ids=${icao}&format=raw`;
-    let lastErr = null;
-
-    for (const buildProxyUrl of METAR_CORS_PROXIES) {
-      try {
-        const res = await fetch(buildProxyUrl(targetUrl));
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const text = (await res.text()).trim();
-        if (!text) throw new Error("empty response");
-        return text;
-      } catch (err) {
-        lastErr = err; // try the next proxy in the list
-      }
-    }
-    throw lastErr; // every proxy failed
+    const res = await fetch(METAR_WORKER_URL + "?icao=" + encodeURIComponent(icao));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const text = (await res.text()).trim();
+    if (!text) throw new Error("empty response");
+    return text;
   }
 
   AIRPORTS.forEach(ap => {
