@@ -6,8 +6,19 @@
 <title>Wheatland Weather Radar</title>
 
 <!--
-  Wheatland Weather Radar — v2
+  Wheatland Weather Radar — v3
   ----------------------------------------------------------
+  v3 fixes the "Zoom Level Not Supported" placeholder tiles you'd see
+  covering the radar overlay — that's RainViewer's radar tile API
+  refusing zoom levels past 7, the exact same ceiling that caused
+  "zoom level not supported" on the ESP32 version. There, we had to
+  hand-build crop/scale logic to work around it. Here, Leaflet's
+  maxNativeZoom option on the radar tile layer does the equivalent
+  automatically — it reuses and upscales the deepest available tile
+  for zoom levels beyond 7 instead of requesting one that doesn't
+  exist. Also lowered the starting zoom from 8 to 7 to match that
+  same ceiling, so the initial view isn't already past it.
+
   v2 changes (fixing a black-screen/scrollable-page report on v1):
     - Map container height is now set via JavaScript (window.innerHeight)
       instead of relying on CSS height:100%, which can misbehave in some
@@ -116,7 +127,7 @@
 <script>
   // ---- Config ----
   const START_LAT = 39.0154, START_LON = -121.4244; // Wheatland, CA
-  const START_ZOOM = 8; // Leaflet zoom is the same standard slippy-map scale as the ESP32 project used
+  const START_ZOOM = 7; // matches RainViewer's native radar tile ceiling — see v3 note
 
   const RADAR_REFRESH_MS = 10 * 60 * 1000; // 10 minutes, matches the ESP32 version
   const METAR_CORS_PROXY = "https://api.allorigins.win/raw?url="; // see KNOWN LIMITATION above
@@ -152,7 +163,15 @@
       const tileUrl = 'https://tilecache.rainviewer.com' + latest.path + '/256/{z}/{x}/{y}/2/1_1.png';
 
       if (radarLayer) map.removeLayer(radarLayer);
-      radarLayer = L.tileLayer(tileUrl, { opacity: 0.65, zIndex: 5 }).addTo(map);
+      radarLayer = L.tileLayer(tileUrl, {
+        opacity: 0.65,
+        zIndex: 5,
+        maxNativeZoom: 7, // RainViewer's radar tiles don't exist past zoom 7 — same
+                          // ceiling we hit on the ESP32. Leaflet automatically reuses
+                          // and upscales the zoom-7 tile for deeper zoom levels instead
+                          // of requesting one that doesn't exist (which is what showed
+                          // as "Zoom Level Not Supported" placeholder tiles).
+      }).addTo(map);
 
       const t = new Date(latest.time * 1000);
       badge.textContent = "Radar: " + t.toLocaleTimeString();
