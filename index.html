@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Wheatland Weather Radar</title>
+
+<!--
+  Wheatland Weather Radar — v2
+  ----------------------------------------------------------
+  v2 changes (fixing a black-screen/scrollable-page report on v1):
+    - Map container height is now set via JavaScript (window.innerHeight)
+      instead of relying on CSS height:100%, which can misbehave in some
+      mobile Safari contexts (local files, home-screen-added pages) —
+      that mismatch was the likely cause of the page scrolling instead
+      of the map filling the screen.
+    - Added an on-page red error banner that catches and displays any
+      JavaScript error directly in the page. There's no way to see a
+      JS console on an iPad without a Mac connected via cable for
+      Safari's Web Inspector, so this is the only way to actually see
+      what broke if something does.
+
+  Open this file directly in Safari (Files app / iCloud Drive / AirDrop),
+  then "Add to Home Screen" for a full-screen, no-address-bar app feel.
+
+  This is a genuinely standalone webpage — no server, no build step, no
+  hosting required. It's delivered as a downloadable file rather than a
+  published Claude artifact specifically because Claude's own hosted-
+  artifact pages run under a stricter content policy that blocks live
+  calls to arbitrary external sites (map tiles, weather APIs). A plain
+  HTML file opened in Safari has no such restriction — it behaves like
+  any other website.
+
+  WHAT'S WORKING:
+    - Leaflet.js map (pinch-zoom, drag-pan, tap markers — all built in,
+      no custom pixel math needed, unlike the ESP32 version)
+    - OpenStreetMap base layer
+    - Live RainViewer radar overlay, auto-refreshed every 10 minutes
+    - Tap Beale AFB (KBAB) or Lincoln Regional (KLHM) markers for METAR
+
+  KNOWN LIMITATION — METAR fetch requires a CORS proxy:
+    aviationweather.gov's API doesn't send the Access-Control-Allow-Origin
+    header browsers require for a webpage to read a cross-origin fetch()
+    response (confirmed against a real bug report hitting this exact
+    endpoint). Map/radar TILES aren't affected — those load as plain
+    images, which don't need CORS — only the METAR text fetch does.
+    This routes that one request through a free public CORS proxy
+    (api.allorigins.win) as a pragmatic fix. That's a third-party
+    dependency outside your control; if it ever goes down or gets slow,
+    the fix is either swapping in a different public proxy or standing
+    up a tiny free one yourself (a Cloudflare Worker is the common,
+    approachable option — a few lines of code, no server to maintain).
+
+  ADDING MORE AIRPORTS: just add another {icao, lat, lon, name} object
+  to the AIRPORTS array below.
+-->
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+
+<style>
+  html, body { margin: 0; padding: 0; background: #111; overflow: hidden; }
+  #map { position: absolute; top: 0; left: 0; width: 100%; }
+
+  .metar-popup { font-family: -apple-system, sans-serif; font-size: 13px; line-height: 1.4; max-width: 260px; }
+  .metar-popup .icao { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+  .metar-popup .raw { font-family: ui-monospace, monospace; word-break: break-word; }
+  .metar-popup .status { color: #888; font-style: italic; }
+
+  .refresh-badge {
+    position: absolute; top: 10px; right: 10px; z-index: 1000;
+    background: rgba(20,20,20,0.85); color: #fff; font-family: -apple-system, sans-serif;
+    font-size: 12px; padding: 6px 10px; border-radius: 8px; pointer-events: none;
+  }
+
+  #errorBanner {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 2000;
+    background: #b00020; color: #fff; font-family: -apple-system, sans-serif;
+    font-size: 13px; padding: 10px; display: none; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+
+<div id="errorBanner"></div>
+<div id="map"></div>
+<div class="refresh-badge" id="refreshBadge">Loading radar…</div>
+
+<script>
+  // On-page error visibility — there's no JS console on an iPad without a
+  // Mac connected via cable for Safari's Web Inspector, so any failure
+  // gets shown directly on screen instead of silently vanishing.
+  function showError(msg) {
+    const banner = document.getElementById('errorBanner');
+    banner.textContent = String(msg);
+    banner.style.display = 'block';
+  }
+  window.addEventListener('error', e => showError('JS error: ' + e.message));
+
+  // Force the map container's actual pixel height via JS rather than
+  // relying on CSS height:100%, which can misbehave on mobile Safari in
+  // some contexts (local files, home-screen-added pages). Re-run on
+  // resize/orientation change too.
+  function sizeMapContainer() {
+    document.getElementById('map').style.height = window.innerHeight + 'px';
+  }
+  sizeMapContainer();
+  window.addEventListener('resize', sizeMapContainer);
+  window.addEventListener('orientationchange', sizeMapContainer);
+
+  if (typeof L === 'undefined') {
+    showError('Leaflet failed to load (no internet connection when this page opened, or the CDN is unreachable). The map library itself never initialized.');
+  }
+</script>
+
+<script>
+  // ---- Config ----
+  const START_LAT = 39.0154, START_LON = -121.4244; // Wheatland, CA
+  const START_ZOOM = 8; // Leaflet zoom is the same standard slippy-map scale as the ESP32 project used
+
+  const RADAR_REFRESH_MS = 10 * 60 * 1000; // 10 minutes, matches the ESP32 version
+  const METAR_CORS_PROXY = "https://api.allorigins.win/raw?url="; // see KNOWN LIMITATION above
+
+  const AIRPORTS = [
+    { icao: "KBAB", name: "Beale AFB",        lat: 39.13611, lon: -121.43639 },
+    { icao: "KLHM", name: "Lincoln Regional",  lat: 38.90917, lon: -121.35139 },
+  ];
+
+  try {
+
+  // ---- Map setup ----
+  const map = L.map('map', {
+    zoomControl: true,
+  }).setView([START_LAT, START_LON], START_ZOOM);
+
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+
+  let radarLayer = null;
+
+  // ---- Radar overlay (RainViewer) ----
+  async function refreshRadarLayer() {
+    const badge = document.getElementById('refreshBadge');
+    try {
+      badge.textContent = "Fetching radar…";
+      const res = await fetch('https://api.rainviewer.com/public/weather-maps.json');
+      const data = await res.json();
+      const frames = data.radar.past;
+      const latest = frames[frames.length - 1];
+      const tileUrl = 'https://tilecache.rainviewer.com' + latest.path + '/256/{z}/{x}/{y}/2/1_1.png';
+
+      if (radarLayer) map.removeLayer(radarLayer);
+      radarLayer = L.tileLayer(tileUrl, { opacity: 0.65, zIndex: 5 }).addTo(map);
+
+      const t = new Date(latest.time * 1000);
+      badge.textContent = "Radar: " + t.toLocaleTimeString();
+    } catch (err) {
+      badge.textContent = "Radar fetch failed";
+      console.error("Radar refresh error:", err);
+    }
+  }
+
+  refreshRadarLayer();
+  setInterval(refreshRadarLayer, RADAR_REFRESH_MS);
+
+  // ---- Airport markers + tap-to-METAR ----
+  function airportIcon() {
+    return L.divIcon({
+      className: '',
+      html: '<div style="width:16px;height:16px;border-radius:50%;background:#ff8fa3;border:2px solid #000;box-shadow:0 0 2px rgba(0,0,0,0.6);"></div>',
+      iconSize: [16, 16],
+      iconAnchor: [8, 8],
+    });
+  }
+
+  async function fetchMetar(icao) {
+    const targetUrl = `https://aviationweather.gov/api/data/metar?ids=${icao}&format=raw`;
+    const res = await fetch(METAR_CORS_PROXY + encodeURIComponent(targetUrl));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const text = (await res.text()).trim();
+    if (!text) throw new Error("empty response");
+    return text;
+  }
+
+  AIRPORTS.forEach(ap => {
+    const marker = L.marker([ap.lat, ap.lon], { icon: airportIcon() }).addTo(map);
+    const popup = L.popup();
+
+    marker.on('click', async () => {
+      popup.setLatLng([ap.lat, ap.lon]);
+      popup.setContent(`<div class="metar-popup"><div class="icao">${ap.icao} — ${ap.name}</div><div class="status">Fetching METAR…</div></div>`);
+      popup.openOn(map);
+
+      try {
+        const metar = await fetchMetar(ap.icao);
+        popup.setContent(`<div class="metar-popup"><div class="icao">${ap.icao} — ${ap.name}</div><div class="raw">${metar}</div></div>`);
+      } catch (err) {
+        popup.setContent(`<div class="metar-popup"><div class="icao">${ap.icao} — ${ap.name}</div><div class="status">METAR unavailable (${err.message})</div></div>`);
+      }
+    });
+  });
+
+  } catch (initErr) {
+    showError('Map initialization failed: ' + initErr.message);
+  }
+</script>
+
+</body>
+</html>
