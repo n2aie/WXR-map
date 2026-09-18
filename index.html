@@ -140,7 +140,7 @@
       const tileUrl = 'https://tilecache.rainviewer.com' + latest.path + '/256/{z}/{x}/{y}/2/1_1.png';
 
       if (radarLayer) map.removeLayer(radarLayer);
-      radarLayer = L.tileLayer(tileUrl, { opacity: 0.65, zIndex: 6, maxNativeZoom: 10 }).addTo(map);
+      radarLayer = L.tileLayer(tileUrl, { opacity: 0.65, zIndex: 5, maxNativeZoom: 6 }).addTo(map);
 
       const t = new Date(latest.time * 1000);
       badge.textContent = "Radar: " + t.toLocaleTimeString();
