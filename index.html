@@ -6,86 +6,40 @@
 <title>Wheatland Weather Radar</title>
 
 <!--
-  Wheatland Weather Radar — v5
+  Wheatland Weather Radar — v3
   ----------------------------------------------------------
-  v5 replaces the public CORS proxies entirely with a personal Cloudflare
-  Worker (metar-proxy.vince320.workers.dev) that fetches METAR data and
-  attaches proper CORS headers itself. This is the permanent fix for the
-  proxy unreliability in v4 — since it's owned rather than a shared free
-  service, it can't suddenly start requiring payment or go down the way
-  corsproxy.io and allorigins.win did. See metar_proxy_worker.js for the
-  Worker's own source and deployment steps.
-
-  v4 fixes "METAR unavailable (Failed to fetch)" by trying a second
-  public CORS proxy (corsproxy.io) automatically if the first
-  (api.allorigins.win) fails. Important nuance behind this: testing a
-  proxy URL by typing it into Safari's address bar does NOT prove it
-  works for our use case — that's a plain page navigation, which is
-  never subject to CORS at all. CORS only restricts JavaScript-
-  initiated fetch() calls, so a proxy can work fine when visited
-  directly while still failing for the page's actual fetch() request.
-  Browsers also deliberately hide the specific reason a CORS fetch
-  failed from JavaScript (a security measure), which is why the error
-  was just a generic "Failed to fetch" with no further detail
-  available — hence trying a second proxy rather than chasing a more
-  specific diagnosis that isn't accessible to us.
-
-  v3 fixes the "Zoom Level Not Supported" placeholder tiles you'd see
-  covering the radar overlay — that's RainViewer's radar tile API
-  refusing zoom levels past 7, the exact same ceiling that caused
-  "zoom level not supported" on the ESP32 version. There, we had to
-  hand-build crop/scale logic to work around it. Here, Leaflet's
-  maxNativeZoom option on the radar tile layer does the equivalent
-  automatically — it reuses and upscales the deepest available tile
-  for zoom levels beyond 7 instead of requesting one that doesn't
-  exist. Also lowered the starting zoom from 8 to 7 to match that
-  same ceiling, so the initial view isn't already past it.
-
-  v2 changes (fixing a black-screen/scrollable-page report on v1):
-    - Map container height is now set via JavaScript (window.innerHeight)
-      instead of relying on CSS height:100%, which can misbehave in some
-      mobile Safari contexts (local files, home-screen-added pages) —
-      that mismatch was the likely cause of the page scrolling instead
-      of the map filling the screen.
-    - Added an on-page red error banner that catches and displays any
-      JavaScript error directly in the page. There's no way to see a
-      JS console on an iPad without a Mac connected via cable for
-      Safari's Web Inspector, so this is the only way to actually see
-      what broke if something does.
+  v3 changes (fixing the "METAR popup shows the entire bbox JSON dump"
+  report from v2's METAR rework):
+    - METAR fetching is now a background refresh into a lookup table
+      (latestStations), keyed by ICAO. Nothing is drawn or shown until
+      a marker is tapped.
+    - Airport markers are back to a small, hand-maintained list
+      (AIRPORTS array) instead of one marker per station in the bbox
+      response — same spirit as the original two-airport version, but
+      now the METAR text comes from one shared bbox fetch instead of a
+      separate fetch per tap.
+    - Markers are smaller (10px) per request.
+    - METAR fetch now goes through a personal Cloudflare Worker
+      (metar-proxy.vince320.workers.dev) instead of a public CORS
+      proxy. The worker itself just fetches the bbox JSON from
+      aviationweather.gov and returns it with CORS headers attached —
+      all I/O happens inside its fetch(request) handler, not at
+      top-level (Workers disallow top-level async/timers/random).
 
   Open this file directly in Safari (Files app / iCloud Drive / AirDrop),
   then "Add to Home Screen" for a full-screen, no-address-bar app feel.
-
-  This is a genuinely standalone webpage — no server, no build step, no
-  hosting required. It's delivered as a downloadable file rather than a
-  published Claude artifact specifically because Claude's own hosted-
-  artifact pages run under a stricter content policy that blocks live
-  calls to arbitrary external sites (map tiles, weather APIs). A plain
-  HTML file opened in Safari has no such restriction — it behaves like
-  any other website.
+  Also deployed at https://n2aie.github.io/WXR-map/ via GitHub Pages.
 
   WHAT'S WORKING:
-    - Leaflet.js map (pinch-zoom, drag-pan, tap markers — all built in,
-      no custom pixel math needed, unlike the ESP32 version)
+    - Leaflet.js map (pinch-zoom, drag-pan, tap markers — all built in)
     - OpenStreetMap base layer
     - Live RainViewer radar overlay, auto-refreshed every 10 minutes
-    - Tap Beale AFB (KBAB) or Lincoln Regional (KLHM) markers for METAR
+    - Tap Beale AFB (KBAB) or Lincoln Regional (KLHM) markers for METAR,
+      pulled from a shared background fetch, not a per-tap request
 
-  KNOWN LIMITATION — METAR fetch requires a CORS proxy:
-    aviationweather.gov's API doesn't send the Access-Control-Allow-Origin
-    header browsers require for a webpage to read a cross-origin fetch()
-    response (confirmed against a real bug report hitting this exact
-    endpoint). Map/radar TILES aren't affected — those load as plain
-    images, which don't need CORS — only the METAR text fetch does.
-    This routes that one request through a free public CORS proxy
-    (api.allorigins.win) as a pragmatic fix. That's a third-party
-    dependency outside your control; if it ever goes down or gets slow,
-    the fix is either swapping in a different public proxy or standing
-    up a tiny free one yourself (a Cloudflare Worker is the common,
-    approachable option — a few lines of code, no server to maintain).
-
-  ADDING MORE AIRPORTS: just add another {icao, lat, lon, name} object
-  to the AIRPORTS array below.
+  ADDING MORE AIRPORTS: add another {icao, lat, lon, name} object to the
+  AIRPORTS array below. As long as the ICAO falls inside the worker's
+  bbox query, its METAR will be available in latestStations once fetched.
 -->
 
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
@@ -149,14 +103,11 @@
 <script>
   // ---- Config ----
   const START_LAT = 39.0154, START_LON = -121.4244; // Wheatland, CA
-  const START_ZOOM = 7; // matches RainViewer's native radar tile ceiling — see v3 note
+  const START_ZOOM = 8;
 
-  const RADAR_REFRESH_MS = 10 * 60 * 1000; // 10 minutes, matches the ESP32 version
-
-  // Your own Cloudflare Worker — see v5 note. Replaces the two public
-  // CORS proxies from v4, which turned out unreliable (corsproxy.io now
-  // requires a paid API key; allorigins.win has been seen timing out).
-  const METAR_WORKER_URL = "https://metar-proxy.vince320.workers.dev/";
+  const RADAR_REFRESH_MS = 10 * 60 * 1000; // 10 minutes
+  const METAR_REFRESH_MS = 10 * 60 * 1000; // same cadence as radar
+  const METAR_PROXY_URL = "https://metar-proxy.vince320.workers.dev/";
 
   const AIRPORTS = [
     { icao: "KBAB", name: "Beale AFB",        lat: 39.13611, lon: -121.43639 },
@@ -189,15 +140,7 @@
       const tileUrl = 'https://tilecache.rainviewer.com' + latest.path + '/256/{z}/{x}/{y}/2/1_1.png';
 
       if (radarLayer) map.removeLayer(radarLayer);
-      radarLayer = L.tileLayer(tileUrl, {
-        opacity: 0.65,
-        zIndex: 5,
-        maxNativeZoom: 7, // RainViewer's radar tiles don't exist past zoom 7 — same
-                          // ceiling we hit on the ESP32. Leaflet automatically reuses
-                          // and upscales the zoom-7 tile for deeper zoom levels instead
-                          // of requesting one that doesn't exist (which is what showed
-                          // as "Zoom Level Not Supported" placeholder tiles).
-      }).addTo(map);
+      radarLayer = L.tileLayer(tileUrl, { opacity: 0.65, zIndex: 5 }).addTo(map);
 
       const t = new Date(latest.time * 1000);
       badge.textContent = "Radar: " + t.toLocaleTimeString();
@@ -210,39 +153,44 @@
   refreshRadarLayer();
   setInterval(refreshRadarLayer, RADAR_REFRESH_MS);
 
-  // ---- Airport markers + tap-to-METAR ----
-  function airportIcon() {
+  // ---- METAR background refresh (lookup table, not drawn until tapped) ----
+  let latestStations = {}; // icaoId -> station object
+
+  async function refreshMetars() {
+    try {
+      const res = await fetch(METAR_PROXY_URL);
+      const stations = await res.json();
+
+      latestStations = {};
+      stations.forEach(st => { latestStations[st.icaoId] = st; });
+    } catch (err) {
+      console.error("METAR refresh error:", err);
+    }
+  }
+
+  refreshMetars();
+  setInterval(refreshMetars, METAR_REFRESH_MS);
+
+  // ---- Airport markers + tap-to-show-METAR ----
+  function metarIcon() {
     return L.divIcon({
       className: '',
-      html: '<div style="width:16px;height:16px;border-radius:50%;background:#ff8fa3;border:2px solid #000;box-shadow:0 0 2px rgba(0,0,0,0.6);"></div>',
-      iconSize: [16, 16],
-      iconAnchor: [8, 8],
+      html: '<div style="width:10px;height:10px;border-radius:50%;background:#ff8fa3;border:1.5px solid #000;box-shadow:0 0 2px rgba(0,0,0,0.6);"></div>',
+      iconSize: [10, 10],
+      iconAnchor: [5, 5],
     });
   }
 
-  async function fetchMetar(icao) {
-    const res = await fetch(METAR_WORKER_URL + "?icao=" + encodeURIComponent(icao));
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const text = (await res.text()).trim();
-    if (!text) throw new Error("empty response");
-    return text;
-  }
-
   AIRPORTS.forEach(ap => {
-    const marker = L.marker([ap.lat, ap.lon], { icon: airportIcon() }).addTo(map);
+    const marker = L.marker([ap.lat, ap.lon], { icon: metarIcon() }).addTo(map);
     const popup = L.popup();
 
-    marker.on('click', async () => {
-      popup.setLatLng([ap.lat, ap.lon]);
-      popup.setContent(`<div class="metar-popup"><div class="icao">${ap.icao} — ${ap.name}</div><div class="status">Fetching METAR…</div></div>`);
-      popup.openOn(map);
-
-      try {
-        const metar = await fetchMetar(ap.icao);
-        popup.setContent(`<div class="metar-popup"><div class="icao">${ap.icao} — ${ap.name}</div><div class="raw">${metar}</div></div>`);
-      } catch (err) {
-        popup.setContent(`<div class="metar-popup"><div class="icao">${ap.icao} — ${ap.name}</div><div class="status">METAR unavailable (${err.message})</div></div>`);
-      }
+    marker.on('click', () => {
+      const st = latestStations[ap.icao];
+      const content = st
+        ? `<div class="metar-popup"><div class="icao">${ap.icao} — ${ap.name}</div><div class="raw">${st.rawOb}</div></div>`
+        : `<div class="metar-popup"><div class="icao">${ap.icao} — ${ap.name}</div><div class="status">No current METAR</div></div>`;
+      popup.setLatLng([ap.lat, ap.lon]).setContent(content).openOn(map);
     });
   });
 
