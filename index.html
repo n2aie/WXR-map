@@ -153,8 +153,18 @@
   refreshRadarLayer();
   setInterval(refreshRadarLayer, RADAR_REFRESH_MS);
 
-  // ---- METAR background refresh (lookup table, not drawn until tapped) ----
-  let latestStations = {}; // icaoId -> station object
+   // ---- METAR background refresh + dynamic markers (every station in the bbox) ----
+  let latestStations = {};
+  let stationMarkers = [];
+
+  function metarIcon() {
+    return L.divIcon({
+      className: '',
+      html: '<div style="width:10px;height:10px;border-radius:50%;background:#ff8fa3;border:1.5px solid #000;box-shadow:0 0 2px rgba(0,0,0,0.6);"></div>',
+      iconSize: [10, 10],
+      iconAnchor: [5, 5],
+    });
+  }
 
   async function refreshMetars() {
     try {
@@ -163,6 +173,25 @@
 
       latestStations = {};
       stations.forEach(st => { latestStations[st.icaoId] = st; });
+
+      // Redraw markers to match the current station list
+      stationMarkers.forEach(m => map.removeLayer(m));
+      stationMarkers = [];
+
+      stations.forEach(st => {
+        if (!st.lat || !st.lon) return;
+
+        const marker = L.marker([st.lat, st.lon], { icon: metarIcon() }).addTo(map);
+        const popup = L.popup();
+
+        marker.on('click', () => {
+          popup.setLatLng([st.lat, st.lon])
+               .setContent(`<div class="metar-popup"><div class="icao">${st.icaoId} — ${st.name || ''}</div><div class="raw">${st.rawOb}</div></div>`)
+               .openOn(map);
+        });
+
+        stationMarkers.push(marker);
+      });
     } catch (err) {
       console.error("METAR refresh error:", err);
     }
@@ -170,7 +199,6 @@
 
   refreshMetars();
   setInterval(refreshMetars, METAR_REFRESH_MS);
-
   // ---- Airport markers + tap-to-show-METAR ----
   function metarIcon() {
     return L.divIcon({
